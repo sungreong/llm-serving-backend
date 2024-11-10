@@ -4,7 +4,18 @@ from datetime import datetime
 from loguru import logger
 from typing import Optional
 
-def create_model_state(db: Session, model_id: str, name: str, engine_type: str, status: str, container_id: str, parameters: dict, gpuId: str, image: str):
+def create_model_state(
+        db: Session, 
+        model_id: str, 
+        name: str, 
+        engine_type: str, 
+        status: str, 
+        container_id: str, 
+        usage_type: str,
+        parameters: dict, 
+        gpuId: str, 
+        image: str
+    ):
     existing_model = db.query(ModelState).filter(ModelState.id == model_id).first()
     if existing_model:
         logger.info(f"모델 ID {model_id}가 이미 존재합니다. 기존 상태를 반환합니다.")
@@ -16,6 +27,7 @@ def create_model_state(db: Session, model_id: str, name: str, engine_type: str, 
         engine_type=engine_type,
         status=status,
         container_id=container_id,
+        usage_type=usage_type,
         gpuId=gpuId,
         image=image,
         parameters=parameters,

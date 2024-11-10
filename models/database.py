@@ -18,6 +18,7 @@ class ModelState(Base):
     id = Column(String, primary_key=True)
     name = Column(String)
     engine_type = Column(String)
+    usage_type = Column(String)
     status = Column(String)
     container_id = Column(String, nullable=True)
     gpuId = Column(String, nullable=True)

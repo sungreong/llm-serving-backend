@@ -165,7 +165,7 @@ class VLLMService:
                         result = await response.json()
                         return {"id": container_id,
                         "name": container_name,                    
-                         "status": "success", "response": result}
+                         "status": "success", "response": result['choices'][-1]['text']}
                     else:
                         raise HTTPException(
                             status_code=response.status,
@@ -174,6 +174,28 @@ class VLLMService:
 
         except Exception as e:
             logger.error(f"Error testing vLLM model {container_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def test_model_embedding(self, container_id: str, model_name: str, prompt: str) -> Dict[str, Any]:
+        try:
+            container = self.docker_client.containers.get(container_id)
+            if container.status != "running":
+                raise HTTPException(status_code=400, detail="Model container is not running")
+
+            container_name = container.name
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://{container_name}:{self.internal_port}/v1/embeddings",
+                    json={"input": prompt, "model": model_name},
+                    timeout=20
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return {"id": container_id, "name": container_name, "status": "success", "response": str(result['data'][-1]['embedding'])}
+                    else:
+                        raise HTTPException(status_code=response.status, detail="Failed to get response from model")
+        except Exception as e:
+            logger.error(f"Error testing vLLM model embedding {container_id}: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def restart_model(self, model_name: str, parameters: Dict[Any, Any] = None) -> Dict[str, Any]:
