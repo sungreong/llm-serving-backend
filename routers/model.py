@@ -309,20 +309,22 @@ async def stop_model(model_id: str, db: Session = Depends(get_db)):
 async def remove_model(model_id: str, db: Session = Depends(get_db)):
     try:
         model_state = model_crud.get_model_state(db, model_id)
-
+        logger.info(f"remove_model model_state : {model_state}")
         if model_state is None:
             raise HTTPException(status_code=404, detail="모델 상태를 찾을 수 없습니다")
-        
-        if model_state.container_id is None:
-            raise HTTPException(status_code=404, detail="컨테이너를 찾을 수 없습니다")
-        
-        if model_state.engine_type == "ollama":
-            result = ollama_service.remove_model(model_state.container_id)
-        elif model_state.engine_type == "vllm":
-            result = vllm_service.remove_model(model_state.container_id)
-        else:
-            raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
-
+        logger.info(f"remove_model model_state.container_id : {model_state.container_id}")
+        if model_state.container_id is not None:        
+            logger.info(f"remove_model model_state.engine_type : {model_state.engine_type}")
+            if model_state.engine_type == "ollama":
+                result = ollama_service.remove_model(model_state.container_id)
+            elif model_state.engine_type == "vllm":
+                result = vllm_service.remove_model(model_state.container_id)
+            else:
+                raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
+        else :
+            logger.info(f"remove_model model_state.container_id is None")
+            result = {"id": model_id, "status": "removed"}
+        logger.info(f"remove_model result : {result} {model_id}")
         # 데이터베이스에서 모델 상태 삭제
         model_state = model_crud.delete_model_state(db, model_id)
         if not model_state:

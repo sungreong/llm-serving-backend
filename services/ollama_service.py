@@ -128,8 +128,17 @@ class OllamaService:
 
     def remove_model(self, container_id: str) -> Dict[str, str]:
         try:
-            container = self.docker_client.containers.get(container_id)
-            container.remove(force=True)
+            try:
+                container = self.docker_client.containers.get(container_id)
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                logger.info(f"Container {container_id} already removed")
+                # 이미 제거된 경우도 성공으로 처리
+                return {"id": container_id, "status": "removed"}
+            except Exception as e:
+                logger.error(f"Error removing Ollama container {container_id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=str(e))
+                
             return {"id": container_id, "status": "removed"}
         except Exception as e:
             logger.error(f"Error removing Ollama container {container_id}: {str(e)}")
