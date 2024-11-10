@@ -61,17 +61,17 @@ docker logs -f llm-serving-backend
 
 ## 환경 변수 설정
 
-| 환경 변수 | 설명 | 기본값 |
-|-----------|------|---------|
-| DOCKER_NETWORK | Docker 네트워크 이름 | llmmodelgate_internal_network |
-| HF_CACHE_PATH | Hugging Face 캐시 경로 | /hosted/workspace/4_trained_model/hf |
-| VLLM_SERVING_PATH | vLLM 서빙 경로 | /home/agilesoda/justtype/LLMMODELGATE/vllm_serving |
-| WEIGHTS_PATH | 모델 가중치 경로 | /data/lops_storage/outputs |
-| OLLAMA_PATH | Ollama 데이터 경로 | /hosted/workspace/4_trained_model/ollama |
-| HF_TOKEN | Hugging Face API 토큰 | - |
-| VLLM_PORT | vLLM 서비스 포트 | 11434 |
-| OLLAMA_PORT | Ollama 서비스 포트 | 11434 |
-| DEFAULT_CUDA_DEVICES | 기본 GPU 장치 ID | 0,1,2,3 |
+| 환경 변수 | 설명 | 
+|-----------|------|
+| DOCKER_NETWORK | Docker 네트워크 이름 | 
+| HF_CACHE_PATH | Hugging Face 캐시 경로 | 
+| VLLM_SERVING_PATH | vLLM 서빙 경로 | 
+| WEIGHTS_PATH | 모델 가중치 경로 | 
+| OLLAMA_PATH | Ollama 데이터 경로 | 
+| HF_TOKEN | Hugging Face API 토큰 | 
+| VLLM_PORT | vLLM 서비스 포트 | 
+| OLLAMA_PORT | Ollama 서비스 포트 | 
+| DEFAULT_CUDA_DEVICES | 기본 GPU 장치 ID |
 
 ## 컨테이너 실행 방법
 
