@@ -14,6 +14,9 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 import asyncio
 from asyncio import Queue
+import os
+import tarfile
+import io
 
 load_dotenv()
 
@@ -110,7 +113,7 @@ def get_db():
 model_task_queue: Optional[Queue] = None
 MAX_WORKERS = 3  # 동시에 처리할 수 있는 최대 작업 수
 
-# 작업자 함수
+# ���업자 함수
 async def model_worker(worker_id: int):
     while True:
         try:
@@ -393,7 +396,7 @@ async def get_logs(model_id: str, db: Session = Depends(get_db)):
         model_state = model_crud.get_model_state(db, model_id)
         logger.info(model_state.__dict__)
         if not model_state:
-            raise HTTPException(status_code=404, detail="모델 상태를 찾을 수 없습니다")
+            raise HTTPException(status_code=404, detail="모델 상태를 찾을 수 없습니")
         
         if model_state.container_id is None :
             raise HTTPException(status_code=404, detail="컨테이너를 찾을 수 없습니다")
@@ -439,19 +442,20 @@ async def test_model(model_id: str, prompt: TestPrompt, db: Session = Depends(ge
             try:
                 response = await asyncio.wait_for(
                     response_queue.get(),
-                    timeout=30.0  # 30초 동안 결과 대기
+                    timeout=60.0  # 60초 동안 결과 대기
                 )
                 return response
             except asyncio.TimeoutError:
                 raise HTTPException(
                     status_code=504,
-                    detail="테스트 응답 시간이 초과되었습니다"
+                    detail="테스트 응답 시이 초과되었니다"
                 )
                 
         except asyncio.TimeoutError:
+            logger.error(f"테스트 큐가 가득 찼습니다. 잠시 후 다시 시도해주세요.")
             raise HTTPException(
                 status_code=503, 
-                detail="테스트 큐가 가득 찼습니다. 잠시 후 다시 시도해주세요."
+                detail="테스트 큐가 가득 찼습니다. 잠시 후 다시 시도주세요."
             )
             
     except HTTPException:
@@ -499,7 +503,7 @@ async def get_models(db: Session = Depends(get_db)):
         return model_list
 
     except Exception as e:
-        logger.error(f"모델 목록 조회 중 오류 발생: {str(e)}")
+        logger.error(f"모델 목록 조회 중 류 발생: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -514,7 +518,7 @@ async def get_container_info(model_id: str, db: Session = Depends(get_db)):
         model_state_dict = model_state.__dict__
         logger.info(model_state_dict)
 
-        # 모델 타입에 따라 테이너 조회
+        # 모델 타에 따라 테이너 조회
         try:
             container_id = model_state.container_id
             if model_state.engine_type == "ollama":
@@ -695,6 +699,204 @@ async def get_model_info(model_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"모델 정보 조회 중 오류 발생: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Nginx 설정 응답 클래스 추가
+class NginxConfigResponse(BaseModel):
+    success: bool
+    message: str
+    config: Optional[str] = None
+
+@app.post("/admin/update-nginx", response_model=NginxConfigResponse)
+async def update_nginx_config(db: Session = Depends(get_db)):
+    try:
+        # 실행 중인 모든 모델 상태 조회
+        model_states = model_crud.get_all_model_states(db)
+        running_models = [m for m in model_states if m.status == "running"]
+
+        # Nginx 설정 템플릿 (서버 블록만 포함)
+        nginx_config = """
+server {
+    listen 80;
+    server_name localhost;
+
+    location / {
+        return 404 "Model not found";
+    }
+"""
+
+        # 각 실행 중인 모델에 대한 location 블록 생성
+        for model in running_models:
+            container_name = None
+            internal_port = None
+            
+            if model.engine_type == "ollama":
+                container_name = f"ollama_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 11434
+            elif model.engine_type == "vllm":
+                container_name = f"vllm_gpu_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 8000
+
+            if container_name and internal_port:
+                location_block = f"""
+    location /{model.name}/ {{
+        proxy_pass http://{container_name}:{internal_port}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Connection "";
+        
+        # CORS 설정 추가
+        add_header 'Access-Control-Allow-Origin' '*';
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS';
+        add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range';
+    }}"""
+                nginx_config += location_block
+
+        # 설정 파일 닫기
+        nginx_config += """
+}
+"""
+
+        try:
+            # Docker 네트워크에서 Nginx 컨테이너 찾기
+            nginx_containers = ollama_service.docker_client.containers.list(
+                filters={
+                    "network": ollama_service.network_name,
+                    "name": "llm-serving-nginx"
+                }
+            )
+            print(nginx_containers)
+            if not nginx_containers:
+                raise HTTPException(status_code=404, detail="Nginx 컨테이너를 찾을 수 없습니다")
+
+            nginx_container = nginx_containers[0]
+
+            # 임시 설정 파일 생성
+            temp_config_path = "/tmp/default.conf"  # 파일 이름 변경
+            with open(temp_config_path, "w") as f:
+                f.write(nginx_config)
+
+            # tar 파일 생성
+            tar_stream = io.BytesIO()
+            with tarfile.open(fileobj=tar_stream, mode='w') as tar:
+                tar.add(temp_config_path, arcname='default.conf')  # arcname 변경
+            tar_stream.seek(0)
+
+            # 설정 파일을 Nginx 컨테이너로 복사
+            nginx_container.put_archive("/etc/nginx/conf.d/", tar_stream.read())
+            # Nginx 설정 테스트
+            test_result = nginx_container.exec_run("nginx -t")
+            if test_result.exit_code != 0:
+                raise Exception(f"Nginx 설정 테스트 실패: {test_result.output.decode()}")
+
+            # Nginx 재시작
+            reload_result = nginx_container.exec_run("nginx -s reload")
+            if reload_result.exit_code != 0:
+                raise Exception(f"Nginx 재시작 실패: {reload_result.output.decode()}")
+
+            # 임시 파일 삭제
+            os.remove(temp_config_path)
+
+            return NginxConfigResponse(
+                success=True,
+                message="Nginx 설정이 성공적으로 업데이트되었습니다.",
+                config=nginx_config
+            )
+
+        except Exception as e:
+            logger.error(f"Nginx 설정 업데이트 중 오류 발생: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Nginx 설정 업데이트 실패: {str(e)}"
+            )
+
+    except Exception as e:
+        logger.error(f"Nginx 설정 업데이트 중 오류 발생: {str(e)}")
+        return NginxConfigResponse(
+            success=False,
+            message=f"Nginx 설정 업데이트 실패: {str(e)}"
+        )
+
+# 모델 서빙 정보 응답 클래스 추가
+class ModelServingInfo(BaseModel):
+    id: str
+    name: str
+    port: Optional[int] = None
+    status: str
+    engine: str
+    nginxEnabled: Optional[bool] = None
+    servingUrl: Optional[str] = None
+
+@app.get("/models/serving", response_model=List[ModelServingInfo])
+async def get_serving_models(db: Session = Depends(get_db)):
+    try:
+        # 실행 중인 모든 모델 상태 조회
+        model_states = model_crud.get_all_model_states(db)
+        running_models = [m for m in model_states if m.status == "running"]
+
+        # Nginx 컨테이너 찾기
+        nginx_containers = ollama_service.docker_client.containers.list(
+            filters={
+                "network": ollama_service.network_name,
+                "name": "nginx"
+            }
+        )
+        nginx_running = len(nginx_containers) > 0
+
+        # 서빙 정보 생성
+        serving_info = []
+        
+        for model in running_models:
+            container_name = None
+            internal_port = None
+            
+            if model.engine_type == "ollama":
+                container_name = f"ollama_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 11434
+            elif model.engine_type == "vllm":
+                container_name = f"vllm_gpu_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 8000
+
+            # Nginx 설정에서 서빙 가능 여부 확인
+            nginx_enabled = False
+            serving_url = None
+            
+            if nginx_running:
+                nginx_container = nginx_containers[0]
+                try:
+                    # Nginx 설정 파일 읽기
+                    config_content = nginx_container.exec_run("cat /etc/nginx/conf.d/default.conf").output.decode()
+                    # 해당 모델의 location 블록이 있는지 확인
+                    nginx_enabled = f"location /{model.name}/" in config_content
+                    if nginx_enabled:
+                        # Nginx 컨테이너의 80 포트 바인딩 정보 가져오기
+                        # 환경변수로 설정된 호스트 IP 사용
+                        HOST_IP = os.getenv("HOST_IP")
+                        HOST_PORT = os.getenv("HOST_PORT")
+                        serving_url = f"http://{HOST_IP}:{HOST_PORT}/{model.name}/"
+                except Exception as e:
+                    logger.error(f"Nginx 설정 확인 중 오류 발생: {str(e)}")
+            HOST_PORT = os.getenv("HOST_PORT")
+            serving_info.append(
+                ModelServingInfo(
+                    id=model.id,
+                    name=model.name,
+                    port=HOST_PORT,
+                    status=model.status,
+                    engine=model.engine_type,
+                    nginxEnabled=nginx_enabled,
+                    servingUrl=serving_url
+                )
+            )
+
+        return serving_info
+
+    except Exception as e:
+        logger.error(f"서빙 모델 정보 조회 중 오류 발생: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 if __name__ == "__main__":
