@@ -6,6 +6,8 @@ from typing import List, Optional, Dict, Any, Union
 from loguru import logger
 from services.ollama_service import OllamaService
 from services.vllm_service import VLLMService
+from services.huggingface_service_tgi import HuggingFaceServiceTGI
+from services.huggingface_service_tei import HuggingFaceServiceTEI
 from dotenv import load_dotenv
 from enum import Enum
 from models.database import SessionLocal, Base, engine
@@ -19,12 +21,16 @@ import os
 from schemas.model_schemas import (
     OllamaModelConfig,
     VLLMModelConfig,
+    HuggingfaceTGIConfig,
+    HuggingfaceTEIConfig,
     ModelResponse,
     EmbeddingResponse,
+    RerankResponse,
     ModelInfo,
     TestPrompt,
     ContainerInfo,
     ModelStateResponse,
+    ModelStatusResponse,
     ModelDetailResponse,
     ModelServingInfo,
     ModelEngineType,
@@ -49,6 +55,8 @@ def get_db():
 # 서비스 초기화
 ollama_service = OllamaService()
 vllm_service = VLLMService()
+huggingface_service_tgi = HuggingFaceServiceTGI()
+huggingface_service_tei = HuggingFaceServiceTEI()
 
 # 전역 큐와 작업자 설정
 model_task_queue: Optional[Queue] = None
@@ -59,12 +67,34 @@ test_task_queue: Optional[Queue] = None
 MAX_TEST_WORKERS = 2  # 테스트 작업자 수
 
 
+async def get_rerank_task(model_state, prompt: str, texts: List[str], response_queue: Queue):
+    try :
+        if model_state.engine_type == "huggingface_tei":
+            result = await huggingface_service_tei.test_model_rerank(model_state.container_id, model_state.name, prompt, texts)
+        else :
+            raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
+    except Exception as e:
+        logger.error(f"Error getting rerank task: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    else :
+        response = RerankResponse(
+            id=result["id"],
+            name=result["name"],
+            status=result["status"],
+            rerank=str(result.get("response", "[]")),
+        )
+        await response_queue.put(response)
+
 async def get_generation_task(model_state, prompt: str, response_queue: Queue):
     try :
         if model_state.engine_type == "ollama":
             result = await ollama_service.test_model(model_state.container_id, model_state.name, prompt)
         elif model_state.engine_type == "vllm":
             result = await vllm_service.test_model(model_state.container_id, model_state.name, prompt)
+        elif model_state.engine_type == "huggingface_tgi":
+            result = await huggingface_service_tgi.test_model(model_state.container_id, model_state.name, prompt)
+        elif model_state.engine_type == "huggingface_tei":
+            raise HTTPException(status_code=400, detail="HuggingFace TEI는 생성 테스트를 지원하지 않습니다")
         logger.info("생성 테스트가 완료되었습니다")
         response = ModelResponse(
             id=result["id"],
@@ -84,6 +114,10 @@ async def get_embedding_task(model_state, prompt: str, response_queue: Queue):
             result = await ollama_service.test_model_embedding(model_state.container_id, model_state.name, prompt)
         elif model_state.engine_type == "vllm":
             result = await vllm_service.test_model_embedding(model_state.container_id, model_state.name, prompt)
+        elif model_state.engine_type == "huggingface_tei":
+            result = await huggingface_service_tei.test_model_embedding(model_state.container_id, model_state.name, prompt)
+        elif model_state.engine_type == "huggingface_tgi":
+            raise HTTPException(status_code=400, detail="HuggingFace TGI는 임베딩 테스트를 지원하지 않습니다")
         logger.info("임베딩 테스트가 완료되었습니다")
         response = EmbeddingResponse(
             id=result["id"],
@@ -112,6 +146,8 @@ async def test_model_worker(worker_id: int):
                     await get_generation_task(model_state, prompt.prompt, response_queue)
                 elif model_state.usage_type == "embedding":
                     await get_embedding_task(model_state, prompt.prompt, response_queue)
+                elif model_state.usage_type == "rerank":
+                    await get_rerank_task(model_state, prompt.prompt, prompt.texts, response_queue)
             except Exception as e:
                 logger.error(f"Test Worker {worker_id}: 테스트 작업 실패: {str(e)}")
             finally:
@@ -128,10 +164,11 @@ async def model_worker(worker_id: int):
             task = await model_task_queue.get()
             config, db, result, task_type = task
             
-            logger.info(f"Worker {worker_id}: 모델 {config.name} {task_type} 작업을 처리합니다")
+            logger.info(f"Worker {worker_id}: 모델 {config.name} {config.engine} {task_type} 작업을 처리합니다")
             
             try:
                 if task_type == "start":
+                    
                     if config.engine == ModelEngineType.OLLAMA:
                         container = await ollama_service.start_model(config.name, config)
                     elif config.engine == ModelEngineType.VLLM:
@@ -139,6 +176,10 @@ async def model_worker(worker_id: int):
                             config.name,
                             {"device_ids": [config.gpu_id] if config.gpu_id else None, "model_args": config.parameters},
                         )
+                    elif config.engine == ModelEngineType.HUGGINGFACE_TGI:
+                        container = await huggingface_service_tgi.start_model(config.name, config)
+                    elif config.engine == ModelEngineType.HUGGINGFACE_TEI:
+                        container = await huggingface_service_tei.start_model(config.name, config)
                 elif task_type == "restart":
                     if config.engine == ModelEngineType.OLLAMA:
                         container = await ollama_service.restart_model(config.name, config)
@@ -147,6 +188,10 @@ async def model_worker(worker_id: int):
                             config.name,
                             {"device_ids": config.parameters.get("device_ids"), "model_args": config.parameters},
                         )
+                    elif config.engine == ModelEngineType.HUGGINGFACE_TGI:
+                        container = await huggingface_service_tgi.restart_model(config.name, config)
+                    elif config.engine == ModelEngineType.HUGGINGFACE_TEI:
+                        container = await huggingface_service_tei.restart_model(config.name, config)
                 
                 # 컨테이너 ID와 함께 상태 업데이트
                 model_crud.update_model_status(
@@ -202,6 +247,21 @@ async def startup_event():
         )
         for container in ollama_containers:
             running_containers.add(container.id)
+
+        tgi_containers = huggingface_service_tgi.docker_client.containers.list(
+            all=True, 
+            filters={"network": huggingface_service_tgi.network_name, "name": "tgi_*"}
+        )
+        for container in tgi_containers:
+            running_containers.add(container.id)
+
+        tei_containers = huggingface_service_tei.docker_client.containers.list(
+            all=True, 
+            filters={"network": huggingface_service_tei.network_name, "name": "tei_*"}
+        )
+        for container in tei_containers:
+            running_containers.add(container.id)
+
             
         # DB에서 모든 모델 상태 조회
         all_models = model_crud.get_all_model_states(db)
@@ -215,6 +275,40 @@ async def startup_event():
         logger.error(f"서버 시작 중 오류 발생: {str(e)}")
     finally:
         db.close()
+
+@router.get("/support")
+async def support_models():
+    return {"models": ["ollama", "vllm", "huggingface_tgi", "huggingface_tei"],
+            "supported_usage_types": ["generation", "embedding", "rerank"],
+            "detailed_usage_types": {
+                "ollama": ['generation','embedding'],
+                "vllm": ['generation'],
+                "huggingface_tgi": ['generation'],
+                "huggingface_tei": ['embedding','rerank']
+            }
+            }
+
+@router.get("/support/{model_name}")
+async def support_model(model_name: str):
+    # using model config 
+    if model_name == "ollama":
+        config = OllamaModelConfig()
+    elif model_name == "vllm":
+        config = VLLMModelConfig()
+    elif model_name == "huggingface_tgi":
+        config = HuggingfaceTGIConfig()
+    elif model_name == "huggingface_tei":
+        config = HuggingfaceTEIConfig()
+    else:
+        raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
+    
+    return config.supported_usageType
+
+import re
+def _safe_container_name(model_name: str) -> str:
+#    뜻 없는 문자는 _로 변환
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', model_name)
+
 
 # start_model 엔드포인트 수정
 @router.post("/start", response_model=ModelResponse)
@@ -234,13 +328,18 @@ async def start_model(
             }
         
         # 초기 상태로 데이터베이스에 기록
-        model_id = f"{config.engine.value}_{config.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        model_id = f"{config.engine.value}_{_safe_container_name(config.name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # model_id = f"{config.engine.value}_{config.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         result = {
             "id": model_id,
             "status": "starting"
         }
         if config.engine.value == "ollama":
             image = 'ollama/ollama'
+        elif config.engine.value == "huggingface_tgi":
+            image = 'ghcr.io/huggingface/text-generation-inference:2.4.0'
+        elif config.engine.value == "huggingface_tei":
+            image = 'ghcr.io/huggingface/text-embeddings-inference:cpu-latest'
         else:
             image = 'vllm/vllm-openai:latest'
         logger.info("config")
@@ -286,6 +385,10 @@ async def stop_model(model_id: str, db: Session = Depends(get_db)):
             result = ollama_service.stop_model(model_state.container_id)
         elif model_state.engine_type == "vllm":
             result = vllm_service.stop_model(model_state.container_id)
+        elif model_state.engine_type == "huggingface_tgi":
+            result = huggingface_service_tgi.stop_model(model_state.container_id)
+        elif model_state.engine_type == "huggingface_tei":
+            result = await huggingface_service_tei.stop_model(model_state.container_id)
         else:
             raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
 
@@ -319,6 +422,10 @@ async def remove_model(model_id: str, db: Session = Depends(get_db)):
                 result = ollama_service.remove_model(model_state.container_id)
             elif model_state.engine_type == "vllm":
                 result = vllm_service.remove_model(model_state.container_id)
+            elif model_state.engine_type == "huggingface_tgi":
+                result = huggingface_service_tgi.remove_model(model_state.container_id)
+            elif model_state.engine_type == "huggingface_tei":
+                 result = await huggingface_service_tei.remove_model(model_state.container_id) 
             else:
                 raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
         else :
@@ -355,14 +462,20 @@ async def get_logs(model_id: str, db: Session = Depends(get_db)):
         container_id = model_state.container_id
         container = None
         try:
-            container = ollama_service.docker_client.containers.get(container_id)
-            return ollama_service.get_logs(container_id)
-        except:
-            try:
-                container = vllm_service.docker_client.containers.get(container_id)
+            if model_state.engine_type == "ollama":
+                container = ollama_service.docker_client.containers.get(container_id)
+                return ollama_service.get_logs(container_id)
+            elif model_state.engine_type == "vllm":
+                container = vllm_service.docker_client.containers.get(container_id) 
                 return vllm_service.get_logs(container_id)
-            except:
-                raise HTTPException(status_code=404, detail="컨테이너를 찾을 수 없습니다")
+            elif model_state.engine_type == "huggingface_tgi":
+                container = huggingface_service_tgi.docker_client.containers.get(container_id)
+                return huggingface_service_tgi.get_logs(container_id)
+            elif model_state.engine_type == "huggingface_tei":
+                container = huggingface_service_tei.docker_client.containers.get(container_id)
+                return await huggingface_service_tei.get_logs(container_id)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail="컨테이너를 찾을 수 없습니다")  
     except Exception as e:
         logger.error(f"로그 조회 중 오류 발생: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -432,9 +545,14 @@ async def get_models(db: Session = Depends(get_db)):
                 model_status = model_state.status
                 if model_state.engine_type == "ollama":
                     container = ollama_service.docker_client.containers.get(model_state.container_id)
-                else:  # vllm
+                elif model_state.engine_type == "vllm":
                     container = vllm_service.docker_client.containers.get(model_state.container_id)
-                
+                elif model_state.engine_type == "huggingface_tgi":
+                    container = huggingface_service_tgi.docker_client.containers.get(model_state.container_id)
+                elif model_state.engine_type == "huggingface_tei":
+                    container = huggingface_service_tei.docker_client.containers.get(model_state.container_id)
+                else :
+                    raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
                 container_status = model_status
             except Exception as e:
                 logger.error(f"컨테이너 상태 조회 중 오류 발생: {str(e)}")
@@ -473,14 +591,14 @@ async def get_container_info(model_id: str, db: Session = Depends(get_db)):
 
         # 모델 타에 따라 테이너 조회
         try:
+            port = 11434  # Ollama 기본 포트
+
             container_id = model_state.container_id
             if model_state.engine_type == "ollama":
                 container = ollama_service.docker_client.containers.get(container_id)
-                port = 11434  # Ollama 기본 포트
                 gpu_id = container.attrs["Config"].get("NVIDIA_VISIBLE_DEVICES")
             elif model_state.engine_type == "vllm":
                 container = vllm_service.docker_client.containers.get(container_id)
-                port = 8000  # vLLM 기본 포트
                 gpu_id = next(
                     (
                         env.split("=")[1]
@@ -489,6 +607,10 @@ async def get_container_info(model_id: str, db: Session = Depends(get_db)):
                     ),
                     None
                 )
+            elif model_state.engine_type == "huggingface_tgi":
+                container = huggingface_service_tgi.docker_client.containers.get(container_id)
+            elif model_state.engine_type == "huggingface_tei":
+                container = huggingface_service_tei.docker_client.containers.get(container_id)
             else:
                 logger.error(f"지원지 않는 모델 타입입니다")
                 raise HTTPException(status_code=400, detail="지원지 않는 모델 타입입니다")
@@ -563,6 +685,23 @@ async def restart_model(model_id: str, db: Session = Depends(get_db)):
                 gpuId=model_state.gpuId,
                 usageType=ModelUsageType.GENERATION
             )
+        elif model_state.engine_type == "huggingface_tgi":
+            config = HuggingfaceTGIConfig(
+                name=model_state.name,
+                engine=ModelEngineType.HUGGINGFACE_TGI,
+                parameters=model_state.parameters,
+                gpuId=model_state.gpuId,
+                usageType=ModelUsageType.GENERATION
+            )
+
+        elif model_state.engine_type == "huggingface_tei":
+            config = HuggingfaceTEIConfig(
+                name=model_state.name,
+                engine=ModelEngineType.HUGGINGFACE_TEI,
+                parameters=model_state.parameters,
+                gpuId=model_state.gpuId,
+                usageType=ModelUsageType.GENERATION
+            )
         else:
             raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
 
@@ -608,6 +747,10 @@ async def get_model_info(model_id: str, db: Session = Depends(get_db)):
                 result = await ollama_service.get_model_info(model_state.container_id)
             elif model_state.engine_type == "vllm":
                 result = await vllm_service.get_model_info(model_state.container_id)
+            elif model_state.engine_type == "huggingface_tgi":
+                result = await huggingface_service_tgi.get_model_info(model_state.container_id)
+            elif model_state.engine_type == "huggingface_tei":
+                result = await huggingface_service_tei.get_model_info(model_state.container_id)
             else:
                 raise HTTPException(status_code=400, detail="지원하지 않는 모델 타입입니다")
 
@@ -621,6 +764,14 @@ async def get_model_info(model_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/{model_id}/status", response_model=ModelStatusResponse)
+async def check_model_status(model_id: str, db: Session = Depends(get_db)):
+    try:
+        model_state = model_crud.get_model_state(db, model_id)
+        return ModelStatusResponse(id=model_id, status=model_state.status)
+    except Exception as e:
+        logger.error(f"모델 상태 확인 중 오류 발생: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/serving", response_model=List[ModelServingInfo])
 async def get_serving_models(db: Session = Depends(get_db)):
@@ -650,7 +801,13 @@ async def get_serving_models(db: Session = Depends(get_db)):
                 internal_port = 11434
             elif model.engine_type == "vllm":
                 container_name = f"vllm_gpu_{model.name.replace(':', '_').replace('/', '_')}"
-                internal_port = 8000
+                internal_port = 11434
+            elif model.engine_type == "huggingface_tgi":
+                container_name = f"tgi_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 11434
+            elif model.engine_type == "huggingface_tei":
+                container_name = f"tei_{model.name.replace(':', '_').replace('/', '_')}"
+                internal_port = 11434
 
             # Nginx 설정에서 서빙 가능 여부 확인
             nginx_enabled = False
